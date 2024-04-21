@@ -1,0 +1,202 @@
+import os
+import discord
+import openai
+import random
+import aiosqlite
+from discord.ext import commands, tasks
+from discord.ext.commands import CommandNotFound, CommandOnCooldown, MissingPermissions
+
+# Set up OpenAI API key and Discord bot token from environment variables
+openai.api_key = os.getenv("OPENAI_API_KEY")
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+
+# Bot's name
+BOT_NAME = "Charlotte"
+
+# Function to fetch command prefix from the SQLite database
+DEFAULT_PREFIX = '!'
+async def get_prefix(bot, message):
+    if not message.guild:
+        return DEFAULT_PREFIX
+    async with aiosqlite.connect("prefixes.db") as db:
+        async with db.execute("SELECT prefix FROM guild_prefix WHERE guild_id = ?", (message.guild.id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else DEFAULT_PREFIX
+
+# Create a Discord bot with dynamic prefix support
+bot = commands.Bot(command_prefix=get_prefix, intents=discord.Intents.default())
+bot.remove_command("help")
+
+# Short-term memory storage (in-memory)
+short_term_memory = {}
+
+# Function to add a new message to short-term memory
+def add_to_short_term_memory(user_id, message):
+    if user_id not in short_term_memory:
+        short_term_memory[user_id] = []
+    # Keep the memory to a certain length (e.g., last 5 messages)
+    if len(short_term_memory[user_id]) >= 5:
+        short_term_memory[user_id].pop(0)  # Remove the oldest message
+    short_term_memory[user_id].append(message)
+
+# Function to retrieve short-term memory
+def get_short_term_memory(user_id):
+    return short_term_memory.get(user_id, [])
+
+# Long-term memory storage (SQLite database)
+async def create_long_term_memory_table():
+    async with aiosqlite.connect("long_term_memory.db") as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS user_long_term_memory (
+            user_id INTEGER PRIMARY KEY,
+            data TEXT
+        )
+        """)
+        await db.commit()
+
+# Function to add or update long-term memory
+async def set_long_term_memory(user_id, data):
+    async with aiosqlite.connect("long_term_memory.db") as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO user_long_term_memory (user_id, data) VALUES (?, ?)",
+            (user_id, data),
+        )
+        await db.commit()
+
+# Function to get long-term memory
+async def get_long_term_memory(user_id):
+    async with aiosqlite.connect("long_term_memory.db") as db:
+        async with db.execute("SELECT data FROM user_long_term_memory WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else ""
+
+# Function to fetch polite scores from the SQLite database
+async def create_politeness_table():
+    async with aiosqlite.connect("politeness.db") as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS user_politeness (
+            user_id INTEGER PRIMARY KEY,
+            score INTEGER
+        )
+        """)
+        await db.commit()
+
+# Function to get politeness score
+async def get_politeness_score(user_id):
+    async with aiosqlite.connect("politeness.db") as db:
+        async with db.execute("SELECT score FROM user_politeness WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+# Function to update politeness score based on message content
+async def update_politeness_score(message):
+    user_id = message.author.id
+    content = message.content.lower()
+
+    if any(word in content for word in ["please", "thank you", "thanks"]):
+        adjustment = 1  # Positive words
+    elif any(word in content for word in ["rude", "mean"]):
+        adjustment = -1  # Negative words
+    else:
+        adjustment = 0  # Neutral words
+
+    async with aiosqlite.connect("politeness.db") as db:
+        current_score = await get_politeness_score(user_id)
+        new_score = current_score + adjustment
+        await db.execute(
+            "INSERT OR REPLACE INTO user_politeness (user_id, score) VALUES (?, ?)",
+            (user_id, new_score),
+        )
+        await db.commit()
+
+# Function to determine if response to all messages is enabled
+async def is_response_enabled(guild_id):
+    async with aiosqlite.connect("response_toggle.db") as db:
+        async with db.execute("SELECT enabled FROM response_toggle WHERE guild_id = ?", (guild_id,)) as cursor:
+            row = await cursor.fetchone()
+            (enabled,) = row if row else (False,)
+            return enabled
+
+# Function to toggle response to all messages
+async def toggle_response(guild_id, enabled):
+    async with aiosqlite.connect("response_toggle.db") as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO response_toggle (guild_id, enabled) VALUES (?, ?)",
+            (guild_id, enabled),
+        )
+        await db.commit()
+
+# GPT-3.5/4 response with context and politeness consideration
+async def get_gpt_response(message):
+    user_id = message.author.id
+    politeness_score = await get_politeness_score(user_id)
+
+    # Rude behavior threshold
+    rude_threshold = -3
+
+    if politeness_score > 0:
+        tone = (
+            f"You are Charlotte, a young Victorian-era British orphan with a gentle and polite demeanor. "
+            "You speak with respect and kindness."
+        )
+    elif politeness_score <= rude_threshold:
+        tone = (
+            f"You are Charlotte, a Victorian-era British orphan with a sharp tongue. You can be sarcastic when dealing with rudeness."
+        )
+    else:
+        tone = (
+            f"You are Charlotte, a Victorian-era British orphan with a reserved tone. You are polite but can express mild annoyance at rudeness."
+        )
+
+    short_term_messages = "\n".join(get_short_term_memory(user_id))
+    
+    complete_prompt = f"{tone}\nRecent interactions:\n{short_term_messages}\nUser said: {message.content}"
+    
+    response = openai.Completion.create(
+        engine="text-davinci-003",
+        prompt=complete_prompt,
+        max_tokens=100,
+        temperature=0.7,
+    )
+
+    return response.choices[0].text.strip()
+
+# Event listener for every message
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return  # Prevent the bot from responding to its own messages
+    
+    user_id = message.author.id
+    add_to_short_term_memory(user_id, message.content)  # Add to short-term memory
+    
+    guild_id = message.guild.id if message.guild else None
+    
+    # Determine if the bot should respond to every message
+    if guild_id:
+        response_enabled = await is_response_enabled(guild_id)
+        if response_enabled or message.content.lower().startswith("hey charlotte,"):
+            await update_politeness_score(message)  # Update politeness score
+            response = await get_gpt_response(message)  # Get GPT response with context
+            await message.channel.send(response)  # Send the response to the channel
+    
+    await bot.process_commands(message)  # Process any commands in the message
+
+# Commands for long-term memory management
+@bot.command(name='setlongterm')
+async def set_long_term(ctx, data):
+    await set_long_term_memory(ctx.author.id, data)
+    await ctx.send(f"Long-term memory updated for {ctx.author.name}.")
+
+@bot.command(name='getlongterm')
+async def get_long_term(ctx):
+    data = await get_long_term_memory(ctx.author.id)
+    await ctx.send(f"Long-term memory for {ctx.author.name}: {data}")
+
+# Command to toggle response to all messages
+@bot.command(name='toggleresponse')
+async def toggle_response_command(ctx, enable: bool):
+    guild_id = ctx.guild.id if ctx.guild else None
+    if guild_id:
+        await toggle_response(guild_id, enable)
+        await ctx.send(f"Response to all messages has been {'enabled' if enable else 'disabled'}.")
